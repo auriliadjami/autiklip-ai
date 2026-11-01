@@ -7,7 +7,7 @@ Admin dashboard + Node.js API for uploading source videos, generating 9:16 clips
 - Upload source videos (MP4, MOV, WEBM, MKV).
 - Create 15–30 second vertical 1080×1920 clips from a chosen start time.
 - Configurable watermark text.
-- Review queue with approve/reject states.
+- Review queue with approve/reject states and authenticated clip downloads (local storage or short-lived R2 signed URLs).
 - Optional Supabase record sync and Cloudflare R2 object upload.
 - Health and integration status endpoints.
 
@@ -25,12 +25,13 @@ Admin dashboard + Node.js API for uploading source videos, generating 9:16 clips
    node -e "import('bcryptjs').then(async b=>console.log(await b.hash('GANTI_PASSWORD',12)))"
    ```
 4. Put the resulting hash in `ADMIN_PASSWORD_HASH`; set `ADMIN_EMAIL` and a long random `JWT_SECRET`.
-5. Install dependencies and run:
+5. Set `JWT_SECRET` to a random value of at least 32 characters. The API rejects short or missing secrets.
+6. Install dependencies and run:
    ```bash
    npm install
    npm start
    ```
-6. Open `http://localhost:3000`.
+7. Open `http://localhost:3000`.
 
 ## Render deployment
 - Create a Web Service from this repository/ZIP after putting the source in GitHub.
@@ -62,7 +63,7 @@ Create a private bucket and an R2 API token with object read/write permission. S
 ## Security / production checklist
 - Replace all secrets; do not commit `.env`.
 - Add HTTPS and configure trusted proxy settings before production.
-- Add CSRF protection and stronger session management for a public deployment.
+- Add CSRF protection and stronger session management for a public deployment. The current admin JWT is stored in browser local storage; consider an HttpOnly secure cookie before public launch.
 - Move media ingestion to direct-to-R2 signed uploads; never buffer large videos in app memory.
 - Add a durable background job queue and separate FFmpeg worker.
 - Add retention/deletion controls for uploaded source files.
