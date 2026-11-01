@@ -199,6 +199,35 @@ app.get('/media/:id.mp4', auth, async (req, res) => {
   const file = path.join(OUTPUT_DIR, `${path.basename(req.params.id)}.mp4`);
   try { await stat(file); res.sendFile(file); } catch { res.status(404).json({ error: 'File klip tidak tersedia di penyimpanan lokal.' }); }
 });
+app.get('/api/jobs/:id/preview', auth, async (req, res) => {
+  const jobs = await readJobs();
+  const job = jobs.find(x => x.id === req.params.id);
+  if (!job || !['review', 'approved'].includes(job.status)) return res.status(404).json({ error: 'Preview belum tersedia.' });
+  try {
+    if (r2 && job.clipPath && !job.clipPath.startsWith('/')) {
+      const url = await getSignedUrl(r2, new GetObjectCommand({ Bucket: process.env.R2_BUCKET, Key: job.clipPath }), { expiresIn: 300 });
+      return res.json({ url, expiresIn: 300 });
+    }
+    const file = path.join(OUTPUT_DIR, `${job.id}.mp4`);
+    await stat(file);
+    return res.json({ url: `/media/${job.id}.mp4`, expiresIn: null });
+  } catch { return res.status(404).json({ error: 'File preview tidak ditemukan.' }); }
+});
+app.patch('/api/jobs/:id/candidates/:index', auth, async (req, res) => {
+  const jobs = await readJobs();
+  const job = jobs.find(x => x.id === req.params.id);
+  const index = Number(req.params.index);
+  if (!job?.analysis?.candidates?.[index]) return res.status(404).json({ error: 'Kandidat tidak ditemukan.' });
+  const { title, caption, hashtags } = req.body || {};
+  if (title !== undefined) job.analysis.candidates[index].title = String(title).trim().slice(0, 100);
+  if (caption !== undefined) job.analysis.candidates[index].caption = String(caption).trim().slice(0, 500);
+  if (hashtags !== undefined) {
+    if (!Array.isArray(hashtags)) return res.status(400).json({ error: 'Hashtag harus berupa daftar.' });
+    job.analysis.candidates[index].hashtags = hashtags.slice(0, 8).map(x => String(x).replace(/^#/, '').replace(/[^\\p{L}\\p{N}_]/gu, '').slice(0, 40)).filter(Boolean);
+  }
+  await persistJob(job);
+  return res.json(job.analysis.candidates[index]);
+});
 app.get('/api/jobs/:id/download', auth, async (req, res) => {
   const jobs = await readJobs();
   const job = jobs.find(x => x.id === req.params.id);
