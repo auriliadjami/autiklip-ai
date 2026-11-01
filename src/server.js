@@ -68,7 +68,7 @@ function auth(req, res, next) {
   if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
     return res.status(503).json({ error: 'JWT_SECRET belum dikonfigurasi dengan aman.' });
   }
-  const token = (req.headers.authorization || '').replace(/^Bearer\\s+/i, '');
+  const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
   try {
     req.user = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
     if (req.user.role !== 'admin') return res.status(403).json({ error: 'Akses admin diperlukan.' });
@@ -90,7 +90,39 @@ async function openAIJson(url, body, headers = {}) {
   if (!response.ok) throw new Error(data.error?.message || `OpenAI API error (${response.status})`);
   return data;
 }
-async function analyzeVideo(job) {
+
+let renderQueue = Promise.resolve();
+let queuedRenders = 0;
+
+function enqueueRender(task) {
+  queuedRenders += 1;
+  const current = renderQueue.then(task);
+  renderQueue = current.catch(() => {}).finally(() => {
+    queuedRenders = Math.max(0, queuedRenders - 1);
+  });
+  return current;
+}
+
+async function ensureSourceLocal(job) {
+  if (job.sourcePath) {
+    try { await stat(job.sourcePath); return job.sourcePath; } catch {}
+  }
+  if (!job.sourceKey || !r2 || !process.env.R2_BUCKET) {
+    throw new Error('File sumber tidak tersedia. Upload ulang video atau periksa konfigurasi R2.');
+  }
+  const extension = path.extname(job.sourceKey) || '.mp4';
+  const localPath = path.join(UPLOAD_DIR, `${job.id}-source${extension}`);
+  const object = await r2.send(new GetObjectCommand({ Bucket: process.env.R2_BUCKET, Key: job.sourceKey }));
+  if (!object.Body) throw new Error('Objek sumber di R2 kosong.');
+  await pipeline(object.Body, createWriteStream(localPath));
+  job.sourcePath = localPath;
+  return localPath;
+}
+
+function escapeDrawtext(value) {
+  return String(value).replace(/\\/g, '\\\\').replace(/:/g, '\\:').replace(/'/g, "\\'").replace(/%/g, '\\%');
+}
+\nasync function analyzeVideo(job) {
   if (!process.env.OPENAI_API_KEY) throw new Error('OPENAI_API_KEY belum diisi. Tambahkan API key untuk mengaktifkan analisis AI.');
   const audioPath = path.join(DATA_DIR, `${job.id}-analysis.mp3`);
   try {
@@ -236,10 +268,73 @@ app.post('/api/jobs/:id/analyze', auth, async (req, res) => {
   })();
 });
 app.post('/api/jobs/:id/clip', auth, async (req, res) => {
-  const jobs = await readJobs(); const job = jobs.find(x => x.id === req.params.id);
+  const jobs = await readJobs();
+  const job = jobs.find(x => x.id === req.params.id);
   if (!job) return res.status(404).json({ error: 'Video tidak ditemukan.' });
   if (!['uploaded', 'error'].includes(job.status)) return res.status(409).json({ error: 'Video sedang diproses atau sudah dalam antrean.' });
-  const start = Number(req.body.startSeconds || 0); const duration = Number(req.body.duration || 20);
+
+  const start = Number(req.body.startSeconds ?? 0);
+  const duration = Number(req.body.duration ?? 20);
+  const style = ['classic', 'bold', 'minimal'].includes(req.body.subtitleStyle) ? req.body.subtitleStyle : 'classic';
+  const burnSubtitles = req.body.subtitles === true;
+  if (!Number.isFinite(start) || start < 0 || !Number.isFinite(duration) || duration < MIN_CLIP || duration > MAX_CLIP) {
+    return res.status(400).json({ error: `Rentang klip harus ${MIN_CLIP}–${MAX_CLIP} detik dan waktu mulai tidak boleh negatif.` });
+  }
+  const candidate = req.body.candidate && typeof req.body.candidate === 'object' ? req.body.candidate : null;
+  job.status = 'queued';
+  job.note = 'Klip masuk antrean render. Proses berjalan satu per satu.';
+  job.selectedClip = { startSeconds: start, duration, subtitleStyle: style, subtitles: burnSubtitles, ...(candidate ? { title: String(candidate.title || '').slice(0, 100), caption: String(candidate.caption || '').slice(0, 500), hashtags: Array.isArray(candidate.hashtags) ? candidate.hashtags.slice(0, 8) : [] } : {}) };
+  await persistJob(job);
+  res.status(202).json({ message: 'Klip masuk antrean render.', id: job.id, status: job.status });
+
+  enqueueRender(async () => {
+    let subtitleFile = null;
+    const outputPath = path.join(OUTPUT_DIR, `${job.id}.mp4`);
+    try {
+      job.status = 'processing';
+      job.note = 'FFmpeg sedang membuat video vertikal 9:16.';
+      await persistJob(job);
+      await ensureSourceLocal(job);
+      const filters = ['scale=1080:1920:force_original_aspect_ratio=increase', 'crop=1080:1920'];
+      if (burnSubtitles && job.analysis?.transcript?.length) {
+        subtitleFile = await createClipSubtitles(job, start, duration, style);
+        if (subtitleFile) filters.push(`subtitles='${escapeSubtitlePath(subtitleFile.file)}':force_style='${subtitleFile.style}'`);
+      }
+      const watermark = escapeDrawtext(process.env.WATERMARK_TEXT || 'AUTOCLIP AI');
+      filters.push(`drawtext=text='${watermark}':fontcolor=white@0.70:fontsize=26:x=w-tw-28:y=h-th-28:box=1:boxcolor=black@0.25:boxborderw=10`);
+      await runFfmpeg([
+        '-y', '-ss', String(start), '-i', job.sourcePath, '-t', String(duration),
+        '-vf', filters.join(','), '-map', '0:v:0', '-map', '0:a?',
+        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
+        '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', outputPath
+      ]);
+      const outputStat = await stat(outputPath);
+      if (!outputStat.size) throw new Error('FFmpeg menghasilkan file kosong.');
+      if (r2 && process.env.R2_BUCKET) {
+        job.clipPath = await uploadToR2(outputPath, `clips/${job.id}.mp4`);
+        await unlink(outputPath).catch(() => {});
+      } else {
+        job.clipPath = outputPath;
+      }
+      job.status = 'review';
+      job.duration = duration;
+      if (candidate) {
+        job.title = String(candidate.title || job.title).slice(0, 100);
+        job.caption = String(candidate.caption || '').slice(0, 500);
+        job.hashtags = Array.isArray(candidate.hashtags) ? candidate.hashtags.slice(0, 8) : [];
+      }
+      job.note = 'Klip selesai dibuat dan menunggu persetujuan admin.';
+      job.renderedAt = new Date().toISOString();
+      await persistJob(job);
+    } catch (error) {
+      job.status = 'error';
+      job.note = `Render gagal: ${error.message}`;
+      await persistJob(job);
+      await unlink(outputPath).catch(() => {});
+    } finally {
+      if (subtitleFile?.file) await unlink(subtitleFile.file).catch(() => {});
+    }
+  }).catch(error => console.error('Render queue:', error));
 });
 app.get('/media/:id.mp4', auth, async (req, res) => {
   const file = path.join(OUTPUT_DIR, `${path.basename(req.params.id)}.mp4`);
@@ -269,7 +364,7 @@ app.patch('/api/jobs/:id/candidates/:index', auth, async (req, res) => {
   if (caption !== undefined) job.analysis.candidates[index].caption = String(caption).trim().slice(0, 500);
   if (hashtags !== undefined) {
     if (!Array.isArray(hashtags)) return res.status(400).json({ error: 'Hashtag harus berupa daftar.' });
-    job.analysis.candidates[index].hashtags = hashtags.slice(0, 8).map(x => String(x).replace(/^#/, '').replace(/[^\\p{L}\\p{N}_]/gu, '').slice(0, 40)).filter(Boolean);
+    job.analysis.candidates[index].hashtags = hashtags.slice(0, 8).map(x => String(x).replace(/^#/, '').replace(/[^\p{L}\p{N}_]/gu, '').slice(0, 40)).filter(Boolean);
   }
   await persistJob(job);
   return res.json(job.analysis.candidates[index]);
