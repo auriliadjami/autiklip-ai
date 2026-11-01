@@ -127,6 +127,29 @@ app.get('/media/:id.mp4', auth, async (req, res) => {
   const file = path.join(OUTPUT_DIR, `${path.basename(req.params.id)}.mp4`);
   try { await stat(file); res.sendFile(file); } catch { res.status(404).json({ error: 'File klip tidak tersedia di penyimpanan lokal.' }); }
 });
+app.get('/api/jobs/:id/download', auth, async (req, res) => {
+  const jobs = await readJobs();
+  const job = jobs.find(x => x.id === req.params.id);
+  if (!job || !['review', 'approved'].includes(job.status)) {
+    return res.status(404).json({ error: 'Klip belum tersedia untuk diunduh.' });
+  }
+  try {
+    if (r2 && job.clipPath && !job.clipPath.startsWith('/')) {
+      const url = await getSignedUrl(r2, new GetObjectCommand({
+        Bucket: process.env.R2_BUCKET,
+        Key: job.clipPath,
+        ResponseContentDisposition: `attachment; filename="autoclip-${job.id}.mp4"`
+      }), { expiresIn: 300 });
+      return res.redirect(url);
+    }
+    const localPath = path.join(OUTPUT_DIR, `${job.id}.mp4`);
+    await stat(localPath);
+    return res.download(localPath, `autoclip-${job.id}.mp4`);
+  } catch {
+    return res.status(404).json({ error: 'File tidak ditemukan. Periksa konfigurasi penyimpanan.' });
+  }
+});
+
 app.post('/api/jobs/:id/review', auth, async (req, res) => {
   const jobs = await readJobs(); const job = jobs.find(x => x.id === req.params.id);
   if (!job) return res.status(404).json({ error: 'Klip tidak ditemukan.' });
