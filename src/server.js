@@ -60,7 +60,7 @@ async function persistJob(job) {
   if (i >= 0) jobs[i] = job; else jobs.unshift(job);
   await saveJobs(jobs);
   if (supabase) {
-    const { error } = await supabase.from('clips').upsert({ id: job.id, title: job.title, status: job.status, source_name: job.sourceName, clip_path: job.clipPath || null, duration: job.duration || null, created_at: job.createdAt, updated_at: new Date().toISOString() });
+    const { error } = await supabase.from('clips').upsert({ id: job.id, title: job.title, status: job.status, source_name: job.sourceName, source_key: job.sourceKey || null, clip_path: job.clipPath || null, duration: job.duration || null, created_at: job.createdAt, updated_at: new Date().toISOString() });
     if (error) console.error('Supabase sync:', error.message);
   }
 }
