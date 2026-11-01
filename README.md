@@ -8,7 +8,8 @@ Admin dashboard + Node.js API for uploading source videos, generating 9:16 clips
 - Create 15–30 second vertical 1080×1920 clips from a chosen start time.
 - Configurable watermark text.
 - Review queue with approve/reject states and authenticated clip downloads (local storage or short-lived R2 signed URLs).
-- Optional Supabase record sync and Cloudflare R2 object upload.
+- Direct browser-to-R2 source upload using short-lived signed PUT URLs (with local upload fallback).
+- Serial FFmpeg render queue (one render at a time) to avoid competing encoders.
 - Health and integration status endpoints.
 
 ## Not yet active
@@ -41,7 +42,7 @@ Admin dashboard + Node.js API for uploading source videos, generating 9:16 clips
 - Build command: `npm install`
 - Start command: `npm start`
 - Add the environment variables from `.env.example` in Render.
-- Important: Render free instances are ephemeral and can sleep. Local uploads/output are not durable. Configure R2 before relying on persistent media; this starter uploads finished clips to R2 but source upload still lands on local disk. For production, change source uploads to presigned R2 uploads and use a separate worker with persistent queue/storage.
+- Important: Render free instances are ephemeral and can sleep. Source videos and finished clips are stored in R2 when configured; the worker downloads a source to temporary local disk only while processing. The current render queue is in-process and serial, not durable: queued work is lost on restart. Job metadata still uses local data/jobs.json with an optional Supabase mirror. Use a persistent worker/queue and load jobs from Supabase before production.
 - FFmpeg encoding may exceed free-instance resource limits. Treat free Render as a prototype environment, not a production video worker.
 
 ## AI highlight analysis (optional)
@@ -59,6 +60,7 @@ create table if not exists public.clips (
   title text,
   status text,
   source_name text,
+  source_key text,
   clip_path text,
   duration integer,
   created_at timestamptz,
@@ -74,8 +76,8 @@ Create a private bucket and an R2 API token with object read/write permission. S
 - Replace all secrets; do not commit `.env`.
 - Add HTTPS and configure trusted proxy settings before production.
 - Add CSRF protection and stronger session management for a public deployment. The current admin JWT is stored in browser local storage; consider an HttpOnly secure cookie before public launch.
-- Move media ingestion to direct-to-R2 signed uploads; never buffer large videos in app memory.
-- Add a durable background job queue and separate FFmpeg worker.
+- Replace the in-process render queue with a durable queue and separate FFmpeg worker; the current queue only serializes work within one running process.
+- Load job metadata from Supabase (the current Supabase integration is a write-through mirror, not the source of truth).
 - Add retention/deletion controls for uploaded source files.
 - Add Supabase Auth/RLS and per-user roles before inviting multiple admins.
 - Implement OAuth flows and review platform requirements before enabling publishing.
