@@ -133,6 +133,40 @@ async function analyzeVideo(job) {
   }
 }
 
+function srtTimestamp(seconds) {
+  const ms = Math.max(0, Math.round(seconds * 1000));
+  const h = Math.floor(ms / 3600000), m = Math.floor((ms % 3600000) / 60000);
+  const s = Math.floor((ms % 60000) / 1000), milli = ms % 1000;
+  return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')},${String(milli).padStart(3,'0')}`;
+}
+function subtitleText(text) {
+  return String(text || '').replace(/-->/g, '→').replace(/[\r\n]+/g, ' ').trim();
+}
+function escapeSubtitlePath(filePath) {
+  return filePath.replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "\\'");
+}
+async function createClipSubtitles(job, start, duration, style) {
+  const segments = job.analysis?.transcript || [];
+  const selected = segments.filter(s => Number(s.end) > start && Number(s.start) < start + duration);
+  if (!selected.length) return null;
+  const presets = {
+    classic: 'FontName=Arial,FontSize=18,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=1,Alignment=2,MarginV=100',
+    bold: 'FontName=Arial,FontSize=22,Bold=1,PrimaryColour=&H0000FFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=3,Shadow=1,Alignment=2,MarginV=110',
+    minimal: 'FontName=Arial,FontSize=16,PrimaryColour=&H00FFFFFF,OutlineColour=&H80000000,BorderStyle=1,Outline=1,Shadow=0,Alignment=2,MarginV=85'
+  };
+  const preset = presets[style] || presets.classic;
+  const content = selected.map((s, i) => {
+    const from = Math.max(0, Number(s.start) - start);
+    const to = Math.min(duration, Number(s.end) - start);
+    if (to <= from) return null;
+    return `${i + 1}\n${srtTimestamp(from)} --> ${srtTimestamp(to)}\n${subtitleText(s.text)}\n`;
+  }).filter(Boolean).join('\n');
+  if (!content.trim()) return null;
+  const file = path.join(OUTPUT_DIR, `${job.id}-subtitles.srt`);
+  await writeFile(file, content, 'utf8');
+  return { file, style: preset };
+}
+
 async function uploadToR2(filePath, key, contentType = 'video/mp4') {
   if (!r2) return null;
   await r2.send(new PutObjectCommand({ Bucket: process.env.R2_BUCKET, Key: key, Body: await readFile(filePath), ContentType: contentType }));
@@ -184,15 +218,23 @@ app.post('/api/jobs/:id/clip', auth, async (req, res) => {
   job.status = 'processing'; job.note = 'Sedang memproses video dengan FFmpeg.'; await persistJob(job);
   res.status(202).json({ message: 'Pemrosesan dimulai.', id: job.id });
   (async () => {
+    let subtitleFile = null;
     try {
-      const watermark = String(req.body.watermark ?? process.env.WATERMARK_TEXT ?? 'AUTOCLIP AI').slice(0, 48).replace(/[^\p{L}\p{N} _.-]/gu, '');
-      const draw = watermark ? `drawtext=text='${watermark.replace(/'/g, "\\'")}':fontcolor=white@0.85:fontsize=24:box=1:boxcolor=black@0.35:boxborderw=10:x=w-tw-24:y=h-th-24` : 'null';
-      const filters = `scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1,${draw}`;
-      await runFfmpeg(['-y', '-ss', String(start), '-i', job.sourcePath, '-t', String(duration), '-vf', filters, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '24', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', output]);
+      const watermark = String(req.body.watermark ?? process.env.WATERMARK_TEXT ?? 'AUTOCLIP AI').slice(0, 48).replace(/[^\\p{L}\\p{N} _.-]/gu, '');
+      const draw = watermark ? `drawtext=text='${watermark.replace(/'/g, "\\\\'")}':fontcolor=white@0.85:fontsize=24:box=1:boxcolor=black@0.35:boxborderw=10:x=w-tw-24:y=h-th-24` : 'null';
+      const filters = [ 'scale=1080:1920:force_original_aspect_ratio=decrease', 'pad=1080:1920:(ow-iw)/2:(oh-ih)/2', 'setsar=1', draw ];
+      if (req.body.subtitles !== false && job.analysis?.transcript?.length) {
+        subtitleFile = await createClipSubtitles(job, start, duration, req.body.subtitleStyle);
+        if (subtitleFile) filters.push(`subtitles='${escapeSubtitlePath(subtitleFile.file)}':force_style='${subtitleFile.style}'`);
+      }
+      await runFfmpeg(['-y', '-ss', String(start), '-i', job.sourcePath, '-t', String(duration), '-vf', filters.join(','), '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '24', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', output]);
       const s = await stat(output); const r2Key = await uploadToR2(output, `clips/${job.id}.mp4`);
-      job.status = 'review'; job.duration = duration; job.clipPath = r2Key || `/media/${job.id}.mp4`; job.fileSize = s.size; job.note = 'Klip siap diperiksa admin. Publikasi belum dilakukan.';
+      job.status = 'review'; job.duration = duration; job.clipPath = r2Key || `/media/${job.id}.mp4`; job.fileSize = s.size;
+      job.subtitlesBurned = Boolean(subtitleFile); job.subtitleStyle = subtitleFile ? req.body.subtitleStyle || 'classic' : null;
+      job.note = subtitleFile ? 'Klip siap diperiksa admin dengan subtitle tertanam.' : 'Klip siap diperiksa admin. Publikasi belum dilakukan.';
       await persistJob(job);
     } catch (e) { job.status = 'error'; job.note = e.message; await persistJob(job); }
+    finally { if (subtitleFile?.file) await unlink(subtitleFile.file).catch(() => {}); }
   })();
 });
 app.get('/media/:id.mp4', auth, async (req, res) => {
