@@ -62,9 +62,17 @@ async function persistJob(job) {
   }
 }
 function auth(req, res, next) {
-  const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
-  try { req.user = jwt.verify(token, process.env.JWT_SECRET || 'dev-only-change-this-secret'); next(); }
-  catch { res.status(401).json({ error: 'Silakan login sebagai admin.' }); }
+  if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
+    return res.status(503).json({ error: 'JWT_SECRET belum dikonfigurasi dengan aman.' });
+  }
+  const token = (req.headers.authorization || '').replace(/^Bearer\\s+/i, '');
+  try {
+    req.user = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
+    if (req.user.role !== 'admin') return res.status(403).json({ error: 'Akses admin diperlukan.' });
+    next();
+  } catch {
+    res.status(401).json({ error: 'Sesi tidak valid atau sudah kedaluwarsa. Silakan login kembali.' });
+  }
 }
 function runFfmpeg(args) {
   return new Promise((resolve, reject) => {
