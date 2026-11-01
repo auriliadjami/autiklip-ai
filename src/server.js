@@ -137,23 +137,6 @@ async function analyzeVideo(job) {
   }
 }
 
-async function ensureSourceLocal(job) {
-  if (job.sourcePath && await stat(job.sourcePath).then(() => true).catch(() => false)) return job.sourcePath;
-  if (!r2 || !job.sourceKey) throw new Error('File sumber tidak tersedia. Periksa penyimpanan R2.');
-  const ext = path.extname(job.sourceName || '.mp4').toLowerCase() || '.mp4';
-  const localPath = path.join(UPLOAD_DIR, job.id + ext);
-  const object = await r2.send(new GetObjectCommand({ Bucket: process.env.R2_BUCKET, Key: job.sourceKey }));
-  await pipeline(Readable.fromWeb(object.Body.transformToWebStream()), createWriteStream(localPath));
-  job.sourcePath = localPath; await persistJob(job); return localPath;
-}
-let renderQueue = Promise.resolve();
-let queuedRenders = 0;
-function enqueueRender(task) {
-  queuedRenders += 1;
-  const run = renderQueue.then(task);
-  renderQueue = run.catch(error => console.error('Render queue:', error));
-  return run.finally(() => { queuedRenders = Math.max(0, queuedRenders - 1); });
-}
 async function uploadToR2(filePath, key, contentType = 'video/mp4') {
   if (!r2) return null;
   await r2.send(new PutObjectCommand({ Bucket: process.env.R2_BUCKET, Key: key, Body: await readFile(filePath), ContentType: contentType }));
@@ -223,22 +206,7 @@ app.post('/api/jobs/:id/clip', auth, async (req, res) => {
   if (!job) return res.status(404).json({ error: 'Video tidak ditemukan.' });
   if (!['uploaded', 'error'].includes(job.status)) return res.status(409).json({ error: 'Video sedang diproses atau sudah dalam antrean.' });
   const start = Number(req.body.startSeconds || 0); const duration = Number(req.body.duration || 20);
-  if (!Number.isFinite(start) || start < 0 || !Number.isFinite(duration) || duration < MIN_CLIP || duration > MAX_CLIP) return res.status(400).json({ error: 'Durasi klip harus ' + MIN_CLIP + '–' + MAX_CLIP + ' detik.' });
-  const output = path.join(OUTPUT_DIR, job.id + '.mp4');
-  job.status = 'queued'; job.note = 'Menunggu antrean render. Antrean aktif: ' + (queuedRenders + 1); await persistJob(job);
-  res.status(202).json({ message: 'Render masuk antrean.', id: job.id, queued: queuedRenders + 1 });
-  enqueueRender(async () => {
-    try {
-      job.status = 'processing'; job.note = 'Diproses FFmpeg (satu render pada satu waktu).'; await persistJob(job);
-      await ensureSourceLocal(job);
-      const watermark = String(req.body.watermark ?? process.env.WATERMARK_TEXT ?? 'AUTOCLIP AI').slice(0, 48).replace(/[^\p{L}\p{N} _.-]/gu, '');
-      const draw = watermark ? "drawtext=text='" + watermark.replace(/'/g, "\\\\'") + "':fontcolor=white@0.85:fontsize=24:box=1:boxcolor=black@0.35:boxborderw=10:x=w-tw-24:y=h-th-24" : 'null';
-      const filters = 'scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1,' + draw;
-      await runFfmpeg(['-y', '-ss', String(start), '-i', job.sourcePath, '-t', String(duration), '-vf', filters, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '24', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', output]);
-      const fileStat = await stat(output); const r2Key = await uploadToR2(output, 'clips/' + job.id + '.mp4');
-      job.status = 'review'; job.duration = duration; job.clipPath = r2Key || '/media/' + job.id + '.mp4'; job.fileSize = fileStat.size; job.note = 'Klip siap diperiksa admin. Publikasi belum dilakukan.'; await persistJob(job);
-    } catch (error) { job.status = 'error'; job.note = error.message; await persistJob(job); }
-  });
+
 });
 app.get('/media/:id.mp4', auth, async (req, res) => {
   const file = path.join(OUTPUT_DIR, `${path.basename(req.params.id)}.mp4`);

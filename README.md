@@ -14,9 +14,7 @@ Admin dashboard + Node.js API for uploading source videos, generating 9:16 clips
 
 ## Not yet active
 - AI highlight detection and transcript-based clip suggestions are available when `OPENAI_API_KEY` is configured. This uses OpenAI transcription + text analysis APIs and incurs usage charges.
-- Admin can edit candidate title, caption, and hashtags before generating a clip.
-- Admin can preview rendered clips in the dashboard before approving them.
-- Burned-in subtitles, subtitle editing, and final AI caption/hashtag generation are not yet implemented; suggested candidates include draft caption and hashtags.
+
 - YouTube URL ingestion. Use videos you own or are authorized to process; platform restrictions apply.
 - TikTok and YouTube publishing. These require OAuth credentials, API scopes, platform app setup/approval, and a publishing implementation. Approval in this dashboard does not publish anything.
 - Full Supabase Auth / multi-user roles. This starter uses one server-configured admin login; Supabase is currently an optional records mirror.
@@ -51,6 +49,7 @@ Admin dashboard + Node.js API for uploading source videos, generating 9:16 clips
 - The extracted audio must be under 24 MB. Long videos may exceed this limit; split or shorten them before analysis.
 - OpenAI API usage is billed separately and is not included in the hosting budget. Never put the API key in frontend code or commit it to Git.
 - AI suggestions are editorial candidates, not guaranteed viral moments. Admin must review each candidate and approve the resulting clip.
+- When creating a clip, choose whether to burn subtitles and select `classic`, `bold`, or `minimal`. Subtitles are generated from timestamped transcript segments that overlap the selected clip. This requires an FFmpeg build with the `subtitles`/libass filter; if the deployed FFmpeg build lacks it, render will fail with a filter error.
 
 ## Supabase
 Create a table named `clips`:
