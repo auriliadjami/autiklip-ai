@@ -2,7 +2,7 @@ name: Validate Node.js syntax
 
 on:
   pull_request:
-    branches: [main, 'fix/**']
+    branches: [main, 'fix/**', 'feature/**']
   push:
     branches: [main, 'fix/**']
 
