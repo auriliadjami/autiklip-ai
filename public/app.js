@@ -13,4 +13,57 @@ window.downloadClip=async id=>{try{const r=await fetch(`/api/jobs/${id}/download
 window.review=async(id,action)=>{try{await api(`/api/jobs/${id}/review`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action})});refresh()}catch(e){alert(e.message)}};
 async function status(){try{const s=await api('/api/config/status');$('#integrations').innerHTML=`<span>AI (OpenAI): ${s.openai?'terhubung':'API key belum diisi'}</span><span>Supabase: ${s.supabase?'terhubung':'belum dikonfigurasi'}</span><span>Cloudflare R2: ${s.cloudflareR2?'terhubung':'belum dikonfigurasi'}</span><span>TikTok: ${s.tiktok?'terhubung':'belum terhubung'}</span><span>YouTube: ${s.youtube?'terhubung':'belum terhubung'}</span>`}catch{}}
 function label(s){return ({uploaded:'Uploaded',processing:'Processing',queued:'Dalam antrean',review:'Menunggu review',approved:'Disetujui',rejected:'Ditolak',error:'Error'})[s]||s}function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-showApp();
+
+window.makeClip=async id=>{
+  const start=Number(prompt('Mulai klip dari detik ke berapa?', '0'));
+  if(!Number.isFinite(start)||start<0)return;
+  const duration=Number(prompt('Durasi klip (15–30 detik):','20'));
+  if(!Number.isFinite(duration)||duration<15||duration>30){alert('Durasi harus 15–30 detik.');return}
+  try{await api(`/api/jobs/${id}/clip`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({startSeconds:start,duration,subtitles:false})});alert('Klip masuk antrean render.');refresh()}catch(e){alert(e.message)}
+};
+window.makeSuggestedClip=async(id,index)=>{
+  try{
+    const jobs=await api('/api/jobs');
+    const job=jobs.find(x=>x.id===id);
+    const candidate=job?.analysis?.candidates?.[index];
+    if(!candidate)throw new Error('Kandidat klip tidak ditemukan.');
+    await api(`/api/jobs/${id}/clip`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({startSeconds:candidate.startSeconds,duration:candidate.duration,subtitles:true,subtitleStyle:'classic',candidate})});
+    alert('Kandidat masuk antrean render. Subtitle akan dibuat dari transkrip AI jika tersedia.');
+    refresh();
+  }catch(e){alert(e.message)}
+};
+window.editCandidate=async(id,index)=>{
+  try{
+    const jobs=await api('/api/jobs');
+    const candidate=jobs.find(x=>x.id===id)?.analysis?.candidates?.[index];
+    if(!candidate)throw new Error('Kandidat tidak ditemukan.');
+    const title=prompt('Edit judul klip:',candidate.title);if(title===null)return;
+    const caption=prompt('Edit caption:',candidate.caption);if(caption===null)return;
+    const tags=prompt('Hashtag (pisahkan dengan koma):',(candidate.hashtags||[]).join(', '));if(tags===null)return;
+    await api(`/api/jobs/${id}/candidates/${index}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({title,caption,hashtags:tags.split(',').map(x=>x.trim())})});
+    refresh();
+  }catch(e){alert(e.message)}
+};
+window.previewClip=async id=>{
+  try{
+    const result=await api(`/api/jobs/${id}/preview`);
+    let source=result.url;
+    if(source.startsWith('/')){
+      const response=await fetch(source,{headers:headers()});
+      if(!response.ok)throw new Error('Preview gagal dimuat.');
+      source=URL.createObjectURL(await response.blob());
+    }
+    const video=$('#previewVideo');
+    if(video.dataset.objectUrl)URL.revokeObjectURL(video.dataset.objectUrl);
+    if(source.startsWith('blob:'))video.dataset.objectUrl=source;
+    video.src=source;
+    $('#previewModal').classList.remove('hidden');
+    await video.play().catch(()=>{});
+  }catch(e){alert(e.message)}
+};
+$('#closePreview').addEventListener('click',()=>{
+  const video=$('#previewVideo');video.pause();video.removeAttribute('src');video.load();
+  if(video.dataset.objectUrl){URL.revokeObjectURL(video.dataset.objectUrl);delete video.dataset.objectUrl}
+  $('#previewModal').classList.add('hidden');
+});
+\nshowApp();
