@@ -52,17 +52,32 @@ const upload = multer({ storage, limits: { fileSize: MAX_UPLOAD_MB * 1024 * 1024
   cb(ok ? null : new Error('Format video tidak didukung. Gunakan MP4, MOV, WEBM, atau MKV.'), ok);
 } });
 
-async function readJobs() { return JSON.parse(await readFile(jobsFile, 'utf8')); }
-async function saveJobs(jobs) { await writeFile(jobsFile, JSON.stringify(jobs, null, 2)); }
+async function readJobs() {
+  if (supabase) {
+    const { data, error } = await supabase.from('clips').select('metadata').order('created_at', { ascending: false });
+    if (error) throw new Error(`Gagal membaca data Supabase: ${error.message}`);
+    return (data || []).map(row => row.metadata).filter(Boolean);
+  }
+  return JSON.parse(await readFile(jobsFile, 'utf8'));
+}
+async function saveJobs(jobs) {
+  if (!supabase) await writeFile(jobsFile, JSON.stringify(jobs, null, 2));
+}
 async function persistJob(job) {
+  if (supabase) {
+    const { error } = await supabase.from('clips').upsert({
+      id: job.id, title: job.title, status: job.status, source_name: job.sourceName,
+      source_key: job.sourceKey || null, clip_path: job.clipPath || null,
+      duration: job.duration || null, created_at: job.createdAt,
+      updated_at: new Date().toISOString(), metadata: job
+    }, { onConflict: 'id' });
+    if (error) throw new Error(`Gagal menyimpan job ke Supabase: ${error.message}`);
+    return;
+  }
   const jobs = await readJobs();
   const i = jobs.findIndex(x => x.id === job.id);
   if (i >= 0) jobs[i] = job; else jobs.unshift(job);
   await saveJobs(jobs);
-  if (supabase) {
-    const { error } = await supabase.from('clips').upsert({ id: job.id, title: job.title, status: job.status, source_name: job.sourceName, source_key: job.sourceKey || null, clip_path: job.clipPath || null, duration: job.duration || null, created_at: job.createdAt, updated_at: new Date().toISOString() });
-    if (error) console.error('Supabase sync:', error.message);
-  }
 }
 function auth(req, res, next) {
   if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
