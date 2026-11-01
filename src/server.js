@@ -81,6 +81,58 @@ function runFfmpeg(args) {
     child.on('error', reject); child.on('close', code => code === 0 ? resolve() : reject(new Error(err.slice(-1800) || `FFmpeg exit ${code}`)));
   });
 }
+async function openAIJson(url, body, headers = {}) {
+  const response = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, ...headers }, body });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error?.message || `OpenAI API error (${response.status})`);
+  return data;
+}
+async function analyzeVideo(job) {
+  if (!process.env.OPENAI_API_KEY) throw new Error('OPENAI_API_KEY belum diisi. Tambahkan API key untuk mengaktifkan analisis AI.');
+  const audioPath = path.join(DATA_DIR, `${job.id}-analysis.mp3`);
+  try {
+    await runFfmpeg(['-y', '-i', job.sourcePath, '-vn', '-ac', '1', '-ar', '16000', '-b:a', '32k', '-f', 'mp3', audioPath]);
+    const audioStat = await stat(audioPath);
+    if (audioStat.size > 24 * 1024 * 1024) throw new Error('Audio hasil ekstraksi lebih dari 24 MB. Gunakan video yang lebih pendek atau kompres audio terlebih dahulu.');
+    const form = new FormData();
+    form.append('file', new Blob([await readFile(audioPath)], { type: 'audio/mpeg' }), 'source.mp3');
+    form.append('model', process.env.OPENAI_TRANSCRIPTION_MODEL || 'whisper-1');
+    form.append('response_format', 'verbose_json');
+    form.append('timestamp_granularities[]', 'segment');
+    const transcript = await openAIJson('https://api.openai.com/v1/audio/transcriptions', form);
+    const segments = (transcript.segments || []).map(s => ({ start: s.start, end: s.end, text: s.text })).filter(s => s.text?.trim());
+    if (!segments.length) throw new Error('Transkrip kosong. Pastikan video memiliki audio atau percakapan yang jelas.');
+    const prompt = {
+      task: 'Pilih maksimal 5 momen paling menarik untuk video pendek vertikal. Gunakan timestamp dari transkrip. Pilih momen dengan hook kuat, emosi, insight, punchline, atau cerita yang utuh. Jangan mengarang isi.',
+      constraints: { min_duration_seconds: MIN_CLIP, max_duration_seconds: MAX_CLIP, candidates: 5 },
+      transcript_segments: segments
+    };
+    const completion = await openAIJson('https://api.openai.com/v1/chat/completions', JSON.stringify({
+      model: process.env.OPENAI_HIGHLIGHT_MODEL || 'gpt-4o-mini',
+      temperature: 0.2,
+      response_format: { type: 'json_object' },
+      messages: [
+        { role: 'system', content: 'Kamu editor video short-form. Kembalikan JSON valid dengan properti candidates berupa array. Setiap item wajib memiliki start_seconds, end_seconds, title, reason, caption, hashtags (array string). Timestamp harus sesuai rentang transkrip. Durasi setiap kandidat harus 15 sampai 30 detik. Jangan membuat timestamp negatif atau melebihi durasi sumber.' },
+        { role: 'user', content: JSON.stringify(prompt) }
+      ]
+    }), { 'Content-Type': 'application/json' });
+    const parsed = JSON.parse(completion.choices?.[0]?.message?.content || '{}');
+    const maxEnd = Math.max(...segments.map(s => s.end));
+    const candidates = (parsed.candidates || []).map(x => ({
+      startSeconds: Math.max(0, Number(x.start_seconds)),
+      duration: Math.min(MAX_CLIP, Math.max(MIN_CLIP, Number(x.end_seconds) - Number(x.start_seconds))),
+      title: String(x.title || 'Klip pilihan').slice(0, 100),
+      reason: String(x.reason || '').slice(0, 240),
+      caption: String(x.caption || '').slice(0, 500),
+      hashtags: Array.isArray(x.hashtags) ? x.hashtags.slice(0, 8).map(t => String(t).replace(/^#/, '').slice(0, 40)) : []
+    })).filter(x => Number.isFinite(x.startSeconds) && Number.isFinite(x.duration) && x.startSeconds + x.duration <= maxEnd + 0.5);
+    if (!candidates.length) throw new Error('AI belum menemukan kandidat klip yang valid. Coba video lain.');
+    return { transcript: segments, candidates, analyzedAt: new Date().toISOString() };
+  } finally {
+    await unlink(audioPath).catch(() => {});
+  }
+}
+
 async function uploadToR2(filePath, key, contentType = 'video/mp4') {
   if (!r2) return null;
   await r2.send(new PutObjectCommand({ Bucket: process.env.R2_BUCKET, Key: key, Body: await readFile(filePath), ContentType: contentType }));
@@ -102,6 +154,26 @@ app.post('/api/upload', auth, upload.single('video'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Pilih file video terlebih dahulu.' });
   const job = { id: randomUUID(), title: path.parse(req.file.originalname).name, sourceName: req.file.originalname, sourcePath: req.file.path, status: 'uploaded', createdAt: new Date().toISOString(), duration: null, clipPath: null, note: 'Video berhasil diunggah. Tentukan rentang waktu untuk membuat klip.' };
   await persistJob(job); res.status(201).json(job);
+});
+app.post('/api/jobs/:id/analyze', auth, async (req, res) => {
+  const jobs = await readJobs();
+  const job = jobs.find(x => x.id === req.params.id);
+  if (!job) return res.status(404).json({ error: 'Video tidak ditemukan.' });
+  if (!['uploaded', 'error'].includes(job.status)) return res.status(409).json({ error: 'Video sedang diproses atau sudah memiliki klip. Refresh daftar terlebih dahulu.' });
+  job.status = 'analyzing'; job.note = 'AI sedang mengekstrak audio, membuat transkrip, dan mencari momen terbaik.';
+  await persistJob(job);
+  res.status(202).json({ message: 'Analisis AI dimulai.', id: job.id });
+  (async () => {
+    try {
+      job.analysis = await analyzeVideo(job);
+      job.status = 'uploaded';
+      job.note = `Analisis selesai: ${job.analysis.candidates.length} kandidat klip ditemukan.`;
+      await persistJob(job);
+    } catch (error) {
+      job.status = 'error'; job.note = `Analisis AI gagal: ${error.message}`;
+      await persistJob(job);
+    }
+  })();
 });
 app.post('/api/jobs/:id/clip', auth, async (req, res) => {
   const jobs = await readJobs(); const job = jobs.find(x => x.id === req.params.id);
