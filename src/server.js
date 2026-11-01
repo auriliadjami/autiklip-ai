@@ -282,6 +282,93 @@ app.post('/api/jobs/:id/analyze', auth, async (req, res) => {
     }
   })();
 });
+
+async function renderClip(job) {
+  const selected = job.selectedClip || {};
+  const start = Number(selected.startSeconds);
+  const duration = Number(selected.duration);
+  const style = selected.subtitleStyle || 'classic';
+  let subtitleFile = null;
+  const outputPath = path.join(OUTPUT_DIR, `${job.id}.mp4`);
+  try {
+    job.status = 'processing';
+    job.note = 'FFmpeg sedang membuat video vertikal 9:16.';
+    await persistJob(job);
+    await ensureSourceLocal(job);
+    const filters = ['scale=1080:1920:force_original_aspect_ratio=increase', 'crop=1080:1920'];
+    if (selected.subtitles === true && job.analysis?.transcript?.length) {
+      subtitleFile = await createClipSubtitles(job, start, duration, style);
+      if (subtitleFile) filters.push(`subtitles='${escapeSubtitlePath(subtitleFile.file)}':force_style='${subtitleFile.style}'`);
+    }
+    const watermark = escapeDrawtext(process.env.WATERMARK_TEXT || 'AUTOCLIP AI');
+    filters.push(`drawtext=text='${watermark}':fontcolor=white@0.70:fontsize=26:x=w-tw-28:y=h-th-28:box=1:boxcolor=black@0.25:boxborderw=10`);
+    await runFfmpeg([
+      '-y', '-ss', String(start), '-i', job.sourcePath, '-t', String(duration),
+      '-vf', filters.join(','), '-map', '0:v:0', '-map', '0:a?',
+      '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
+      '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', outputPath
+    ]);
+    const outputStat = await stat(outputPath);
+    if (!outputStat.size) throw new Error('FFmpeg menghasilkan file kosong.');
+    if (r2 && process.env.R2_BUCKET) {
+      job.clipPath = await uploadToR2(outputPath, `clips/${job.id}.mp4`);
+      await unlink(outputPath).catch(() => {});
+    } else {
+      job.clipPath = outputPath;
+    }
+    job.status = 'review';
+    job.duration = duration;
+    const candidate = selected;
+    if (candidate.title || candidate.caption || candidate.hashtags) {
+      job.title = String(candidate.title || job.title).slice(0, 100);
+      job.caption = String(candidate.caption || '').slice(0, 500);
+      job.hashtags = Array.isArray(candidate.hashtags) ? candidate.hashtags.slice(0, 8) : [];
+    }
+    job.note = 'Klip selesai dibuat dan menunggu persetujuan admin.';
+    job.renderedAt = new Date().toISOString();
+    await persistJob(job);
+  } finally {
+    if (subtitleFile?.file) await unlink(subtitleFile.file).catch(() => {});
+  }
+}
+
+async function runDurableRenderWorker() {
+  const workerName = `${process.env.HOSTNAME || 'autoclip'}-${process.pid}`;
+  while (true) {
+    try {
+      const { data, error } = await supabase.rpc('claim_next_render_job', { worker_name: workerName });
+      if (error) throw new Error(error.message);
+      const queueItem = data?.[0];
+      if (!queueItem) {
+        await new Promise(resolve => setTimeout(resolve, 3000));
+        continue;
+      }
+      const { data: row, error: readError } = await supabase.from('clips').select('metadata').eq('id', queueItem.clip_id).single();
+      if (readError || !row?.metadata) throw new Error(readError?.message || 'Metadata job tidak ditemukan.');
+      const job = row.metadata;
+      try {
+        await renderClip(job);
+        const { error: finishError } = await supabase.from('render_queue').update({
+          status: 'completed', locked_at: null, locked_by: null, last_error: null, updated_at: new Date().toISOString()
+        }).eq('clip_id', queueItem.clip_id);
+        if (finishError) throw new Error(finishError.message);
+      } catch (renderError) {
+        job.status = 'error';
+        job.note = `Render gagal: ${renderError.message}`;
+        await persistJob(job).catch(error => console.error('Persist render error:', error));
+        const { error: queueError } = await supabase.from('render_queue').update({
+          status: 'failed', locked_at: null, locked_by: null,
+          last_error: String(renderError.message).slice(0, 2000), updated_at: new Date().toISOString()
+        }).eq('clip_id', queueItem.clip_id);
+        if (queueError) console.error('Queue update failed:', queueError.message);
+      }
+    } catch (error) {
+      console.error('Durable render worker:', error.message);
+      await new Promise(resolve => setTimeout(resolve, 5000));
+    }
+  }
+}
+
 app.post('/api/jobs/:id/clip', auth, async (req, res) => {
   const jobs = await readJobs();
   const job = jobs.find(x => x.id === req.params.id);
@@ -298,58 +385,35 @@ app.post('/api/jobs/:id/clip', auth, async (req, res) => {
   const candidate = req.body.candidate && typeof req.body.candidate === 'object' ? req.body.candidate : null;
   job.status = 'queued';
   job.note = 'Klip masuk antrean render. Proses berjalan satu per satu.';
-  job.selectedClip = { startSeconds: start, duration, subtitleStyle: style, subtitles: burnSubtitles, ...(candidate ? { title: String(candidate.title || '').slice(0, 100), caption: String(candidate.caption || '').slice(0, 500), hashtags: Array.isArray(candidate.hashtags) ? candidate.hashtags.slice(0, 8) : [] } : {}) };
-  await persistJob(job);
-  res.status(202).json({ message: 'Klip masuk antrean render.', id: job.id, status: job.status });
-
-  enqueueRender(async () => {
-    let subtitleFile = null;
-    const outputPath = path.join(OUTPUT_DIR, `${job.id}.mp4`);
-    try {
-      job.status = 'processing';
-      job.note = 'FFmpeg sedang membuat video vertikal 9:16.';
-      await persistJob(job);
-      await ensureSourceLocal(job);
-      const filters = ['scale=1080:1920:force_original_aspect_ratio=increase', 'crop=1080:1920'];
-      if (burnSubtitles && job.analysis?.transcript?.length) {
-        subtitleFile = await createClipSubtitles(job, start, duration, style);
-        if (subtitleFile) filters.push(`subtitles='${escapeSubtitlePath(subtitleFile.file)}':force_style='${subtitleFile.style}'`);
-      }
-      const watermark = escapeDrawtext(process.env.WATERMARK_TEXT || 'AUTOCLIP AI');
-      filters.push(`drawtext=text='${watermark}':fontcolor=white@0.70:fontsize=26:x=w-tw-28:y=h-th-28:box=1:boxcolor=black@0.25:boxborderw=10`);
-      await runFfmpeg([
-        '-y', '-ss', String(start), '-i', job.sourcePath, '-t', String(duration),
-        '-vf', filters.join(','), '-map', '0:v:0', '-map', '0:a?',
-        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
-        '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', outputPath
-      ]);
-      const outputStat = await stat(outputPath);
-      if (!outputStat.size) throw new Error('FFmpeg menghasilkan file kosong.');
-      if (r2 && process.env.R2_BUCKET) {
-        job.clipPath = await uploadToR2(outputPath, `clips/${job.id}.mp4`);
-        await unlink(outputPath).catch(() => {});
-      } else {
-        job.clipPath = outputPath;
-      }
-      job.status = 'review';
-      job.duration = duration;
-      if (candidate) {
-        job.title = String(candidate.title || job.title).slice(0, 100);
-        job.caption = String(candidate.caption || '').slice(0, 500);
-        job.hashtags = Array.isArray(candidate.hashtags) ? candidate.hashtags.slice(0, 8) : [];
-      }
-      job.note = 'Klip selesai dibuat dan menunggu persetujuan admin.';
-      job.renderedAt = new Date().toISOString();
-      await persistJob(job);
-    } catch (error) {
-      job.status = 'error';
-      job.note = `Render gagal: ${error.message}`;
-      await persistJob(job);
-      await unlink(outputPath).catch(() => {});
-    } finally {
-      if (subtitleFile?.file) await unlink(subtitleFile.file).catch(() => {});
+  job.selectedClip = {
+    startSeconds: start, duration, subtitleStyle: style, subtitles: burnSubtitles,
+    ...(candidate ? { title: String(candidate.title || '').slice(0, 100), caption: String(candidate.caption || '').slice(0, 500), hashtags: Array.isArray(candidate.hashtags) ? candidate.hashtags.slice(0, 8) : [] } : {})
+  };
+  try {
+    await persistJob(job);
+    if (supabase) {
+      const { error } = await supabase.from('render_queue').upsert({
+        clip_id: job.id, status: 'queued', attempts: 0, available_at: new Date().toISOString(),
+        locked_at: null, locked_by: null, last_error: null, updated_at: new Date().toISOString()
+      }, { onConflict: 'clip_id' });
+      if (error) throw new Error(error.message);
     }
-  }).catch(error => console.error('Render queue:', error));
+  } catch (error) {
+    job.status = 'error';
+    job.note = `Gagal memasukkan antrean: ${error.message}`;
+    await persistJob(job).catch(() => {});
+    return res.status(503).json({ error: 'Antrean render tidak dapat disimpan. Coba lagi.' });
+  }
+  res.status(202).json({ message: 'Klip masuk antrean render.', id: job.id, status: job.status });
+  if (!supabase) {
+    enqueueRender(async () => {
+      try { await renderClip(job); }
+      catch (error) {
+        job.status = 'error'; job.note = `Render gagal: ${error.message}`;
+        await persistJob(job).catch(e => console.error('Persist render error:', e));
+      }
+    }).catch(error => console.error('Render queue:', error));
+  }
 });
 app.get('/media/:id.mp4', auth, async (req, res) => {
   const file = path.join(OUTPUT_DIR, `${path.basename(req.params.id)}.mp4`);
@@ -417,4 +481,11 @@ app.post('/api/jobs/:id/review', auth, async (req, res) => {
 });
 app.get('/api/config/status', auth, (_req, res) => res.json({ supabase: Boolean(supabase), cloudflareR2: Boolean(r2), openai: Boolean(process.env.OPENAI_API_KEY), tiktok: false, youtube: false, note: 'Integrasi publikasi memerlukan OAuth dan persetujuan aplikasi platform.' }));
 app.use((err, _req, res, _next) => { console.error(err); res.status(400).json({ error: err.message || 'Terjadi kesalahan.' }); });
-app.listen(PORT, () => console.log(`AUTOCLIP AI running on :${PORT}`));
+app.listen(PORT, () => {
+  console.log(`AUTOCLIP AI running on :${PORT}`);
+  if (supabase) {
+    supabase.rpc('requeue_stale_render_jobs')
+      .then(({ error }) => { if (error) console.error('Stale queue recovery:', error.message); })
+      .finally(() => runDurableRenderWorker());
+  }
+});
