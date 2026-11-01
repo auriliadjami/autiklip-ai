@@ -68,7 +68,7 @@ function auth(req, res, next) {
   if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
     return res.status(503).json({ error: 'JWT_SECRET belum dikonfigurasi dengan aman.' });
   }
-  const token = (req.headers.authorization || '').replace(/^Bearer\\s+/i, '');
+  const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
   try {
     req.user = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
     if (req.user.role !== 'admin') return res.status(403).json({ error: 'Akses admin diperlukan.' });
@@ -120,7 +120,7 @@ async function ensureSourceLocal(job) {
 }
 
 function escapeDrawtext(value) {
-  return String(value).replace(/\\/g, '\\\\\\\\').replace(/:/g, '\\\\:').replace(/'/g, "\\\\'").replace(/%/g, '\\\\%');
+  return String(value).replace(/\\/g, '\\\\').replace(/:/g, '\\:').replace(/'/g, "\\'").replace(/%/g, '\\%');
 }
 \nasync function analyzeVideo(job) {
   if (!process.env.OPENAI_API_KEY) throw new Error('OPENAI_API_KEY belum diisi. Tambahkan API key untuk mengaktifkan analisis AI.');
@@ -364,7 +364,7 @@ app.patch('/api/jobs/:id/candidates/:index', auth, async (req, res) => {
   if (caption !== undefined) job.analysis.candidates[index].caption = String(caption).trim().slice(0, 500);
   if (hashtags !== undefined) {
     if (!Array.isArray(hashtags)) return res.status(400).json({ error: 'Hashtag harus berupa daftar.' });
-    job.analysis.candidates[index].hashtags = hashtags.slice(0, 8).map(x => String(x).replace(/^#/, '').replace(/[^\\p{L}\\p{N}_]/gu, '').slice(0, 40)).filter(Boolean);
+    job.analysis.candidates[index].hashtags = hashtags.slice(0, 8).map(x => String(x).replace(/^#/, '').replace(/[^\p{L}\p{N}_]/gu, '').slice(0, 40)).filter(Boolean);
   }
   await persistJob(job);
   return res.json(job.analysis.candidates[index]);
