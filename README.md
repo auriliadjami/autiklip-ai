@@ -12,7 +12,8 @@ Admin dashboard + Node.js API for uploading source videos, generating 9:16 clips
 - Health and integration status endpoints.
 
 ## Not yet active
-- AI highlight detection, speech transcription/subtitles, and AI captions/hashtags.
+- AI highlight detection and transcript-based clip suggestions are available when `OPENAI_API_KEY` is configured. This uses OpenAI transcription + text analysis APIs and incurs usage charges.
+- Burned-in subtitles, subtitle editing, and final AI caption/hashtag generation are not yet implemented; suggested candidates include draft caption and hashtags.
 - YouTube URL ingestion. Use videos you own or are authorized to process; platform restrictions apply.
 - TikTok and YouTube publishing. These require OAuth credentials, API scopes, platform app setup/approval, and a publishing implementation. Approval in this dashboard does not publish anything.
 - Full Supabase Auth / multi-user roles. This starter uses one server-configured admin login; Supabase is currently an optional records mirror.
@@ -40,6 +41,13 @@ Admin dashboard + Node.js API for uploading source videos, generating 9:16 clips
 - Add the environment variables from `.env.example` in Render.
 - Important: Render free instances are ephemeral and can sleep. Local uploads/output are not durable. Configure R2 before relying on persistent media; this starter uploads finished clips to R2 but source upload still lands on local disk. For production, change source uploads to presigned R2 uploads and use a separate worker with persistent queue/storage.
 - FFmpeg encoding may exceed free-instance resource limits. Treat free Render as a prototype environment, not a production video worker.
+
+## AI highlight analysis (optional)
+- Set `OPENAI_API_KEY` on the server. The dashboard then offers **Analisis AI** for uploaded videos.
+- AUTOCLIP extracts mono MP3 audio at 16 kHz / 32 kbps, transcribes it with the configured transcription model, then asks the highlight model to propose up to five 15–30 second segments with titles, reasons, captions, and hashtags.
+- The extracted audio must be under 24 MB. Long videos may exceed this limit; split or shorten them before analysis.
+- OpenAI API usage is billed separately and is not included in the hosting budget. Never put the API key in frontend code or commit it to Git.
+- AI suggestions are editorial candidates, not guaranteed viral moments. Admin must review each candidate and approve the resulting clip.
 
 ## Supabase
 Create a table named `clips`:
