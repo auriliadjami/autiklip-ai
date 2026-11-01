@@ -7,12 +7,15 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import ffmpegPath from 'ffmpeg-static';
 import { spawn } from 'node:child_process';
+import { Readable } from 'node:stream';
+import { createWriteStream } from 'node:fs';
+import { pipeline } from 'node:stream/promises';
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, writeFile, unlink, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createClient } from '@supabase/supabase-js';
-import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -91,6 +94,7 @@ async function analyzeVideo(job) {
   if (!process.env.OPENAI_API_KEY) throw new Error('OPENAI_API_KEY belum diisi. Tambahkan API key untuk mengaktifkan analisis AI.');
   const audioPath = path.join(DATA_DIR, `${job.id}-analysis.mp3`);
   try {
+    await ensureSourceLocal(job);
     await runFfmpeg(['-y', '-i', job.sourcePath, '-vn', '-ac', '1', '-ar', '16000', '-b:a', '32k', '-f', 'mp3', audioPath]);
     const audioStat = await stat(audioPath);
     if (audioStat.size > 24 * 1024 * 1024) throw new Error('Audio hasil ekstraksi lebih dari 24 MB. Gunakan video yang lebih pendek atau kompres audio terlebih dahulu.');
@@ -133,13 +137,30 @@ async function analyzeVideo(job) {
   }
 }
 
+async function ensureSourceLocal(job) {
+  if (job.sourcePath && await stat(job.sourcePath).then(() => true).catch(() => false)) return job.sourcePath;
+  if (!r2 || !job.sourceKey) throw new Error('File sumber tidak tersedia. Periksa penyimpanan R2.');
+  const ext = path.extname(job.sourceName || '.mp4').toLowerCase() || '.mp4';
+  const localPath = path.join(UPLOAD_DIR, job.id + ext);
+  const object = await r2.send(new GetObjectCommand({ Bucket: process.env.R2_BUCKET, Key: job.sourceKey }));
+  await pipeline(Readable.fromWeb(object.Body.transformToWebStream()), createWriteStream(localPath));
+  job.sourcePath = localPath; await persistJob(job); return localPath;
+}
+let renderQueue = Promise.resolve();
+let queuedRenders = 0;
+function enqueueRender(task) {
+  queuedRenders += 1;
+  const run = renderQueue.then(task);
+  renderQueue = run.catch(error => console.error('Render queue:', error));
+  return run.finally(() => { queuedRenders = Math.max(0, queuedRenders - 1); });
+}
 async function uploadToR2(filePath, key, contentType = 'video/mp4') {
   if (!r2) return null;
   await r2.send(new PutObjectCommand({ Bucket: process.env.R2_BUCKET, Key: key, Body: await readFile(filePath), ContentType: contentType }));
   return key;
 }
 
-app.get('/api/health', (_req, res) => res.json({ ok: true, app: 'AUTOCLIP AI', version: '0.1.0', storage: r2 ? 'cloudflare-r2' : 'local', database: supabase ? 'supabase' : 'local-json', ffmpeg: Boolean(ffmpegPath) }));
+app.get('/api/health', (_req, res) => res.json({ ok: true, app: 'AUTOCLIP AI', version: '0.1.0', storage: r2 ? 'cloudflare-r2' : 'local', database: supabase ? 'supabase' : 'local-json', ffmpeg: Boolean(ffmpegPath), renderConcurrency: 1, queuedRenders }));
 app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body || {};
   const expectedEmail = process.env.ADMIN_EMAIL;
@@ -150,6 +171,28 @@ app.post('/api/auth/login', async (req, res) => {
   res.json({ token: jwt.sign({ email, role: 'admin' }, process.env.JWT_SECRET, { expiresIn: '12h' }), email });
 });
 app.get('/api/jobs', auth, async (_req, res) => res.json(await readJobs()));
+app.post('/api/uploads/presign', auth, async (req, res) => {
+  if (!r2 || !process.env.R2_BUCKET) return res.status(503).json({ error: 'Upload langsung R2 belum dikonfigurasi.' });
+  const body = req.body || {};
+  const allowed = { 'video/mp4': '.mp4', 'video/quicktime': '.mov', 'video/webm': '.webm', 'video/x-matroska': '.mkv' };
+  const ext = allowed[body.contentType]; const size = Number(body.size);
+  if (!ext || !Number.isFinite(size) || size < 1 || size > MAX_UPLOAD_MB * 1024 * 1024) return res.status(400).json({ error: 'Format/ukuran tidak valid. Maksimal ' + MAX_UPLOAD_MB + ' MB.' });
+  const givenExt = path.extname(String(body.filename || '')).toLowerCase();
+  if (givenExt && givenExt !== ext) return res.status(400).json({ error: 'Ekstensi file tidak cocok dengan tipe video.' });
+  const id = randomUUID(); const key = 'sources/' + id + ext;
+  const uploadUrl = await getSignedUrl(r2, new PutObjectCommand({ Bucket: process.env.R2_BUCKET, Key: key, ContentType: body.contentType }), { expiresIn: 300 });
+  res.json({ uploadUrl, key, id, contentType: body.contentType, expiresIn: 300 });
+});
+app.post('/api/uploads/complete', auth, async (req, res) => {
+  if (!r2 || !process.env.R2_BUCKET) return res.status(503).json({ error: 'Cloudflare R2 belum dikonfigurasi.' });
+  const body = req.body || {}; const key = String(body.key || ''); const size = Number(body.size);
+  if (!/^sources\/[0-9a-f-]+\.(mp4|mov|webm|mkv)$/i.test(key) || !Number.isFinite(size) || size < 1 || size > MAX_UPLOAD_MB * 1024 * 1024) return res.status(400).json({ error: 'Data upload tidak valid.' });
+  const object = await r2.send(new HeadObjectCommand({ Bucket: process.env.R2_BUCKET, Key: key }));
+  if (Number(object.ContentLength) !== size) return res.status(400).json({ error: 'Ukuran file di R2 tidak sesuai.' });
+  const name = path.basename(String(body.filename || 'video')).slice(0, 180);
+  const job = { id: key.split('/')[1].replace(/\.[^.]+$/, ''), title: path.parse(name).name, sourceName: name, sourceKey: key, status: 'uploaded', createdAt: new Date().toISOString(), duration: null, clipPath: null, note: 'Video tersimpan langsung di Cloudflare R2.' };
+  await persistJob(job); res.status(201).json(job);
+});
 app.post('/api/upload', auth, upload.single('video'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Pilih file video terlebih dahulu.' });
   const job = { id: randomUUID(), title: path.parse(req.file.originalname).name, sourceName: req.file.originalname, sourcePath: req.file.path, status: 'uploaded', createdAt: new Date().toISOString(), duration: null, clipPath: null, note: 'Video berhasil diunggah. Tentukan rentang waktu untuk membuat klip.' };
@@ -178,22 +221,24 @@ app.post('/api/jobs/:id/analyze', auth, async (req, res) => {
 app.post('/api/jobs/:id/clip', auth, async (req, res) => {
   const jobs = await readJobs(); const job = jobs.find(x => x.id === req.params.id);
   if (!job) return res.status(404).json({ error: 'Video tidak ditemukan.' });
+  if (!['uploaded', 'error'].includes(job.status)) return res.status(409).json({ error: 'Video sedang diproses atau sudah dalam antrean.' });
   const start = Number(req.body.startSeconds || 0); const duration = Number(req.body.duration || 20);
-  if (!Number.isFinite(start) || start < 0 || !Number.isFinite(duration) || duration < MIN_CLIP || duration > MAX_CLIP) return res.status(400).json({ error: `Durasi klip harus ${MIN_CLIP}–${MAX_CLIP} detik dan waktu mulai tidak boleh negatif.` });
-  const output = path.join(OUTPUT_DIR, `${job.id}.mp4`);
-  job.status = 'processing'; job.note = 'Sedang memproses video dengan FFmpeg.'; await persistJob(job);
-  res.status(202).json({ message: 'Pemrosesan dimulai.', id: job.id });
-  (async () => {
+  if (!Number.isFinite(start) || start < 0 || !Number.isFinite(duration) || duration < MIN_CLIP || duration > MAX_CLIP) return res.status(400).json({ error: 'Durasi klip harus ' + MIN_CLIP + '–' + MAX_CLIP + ' detik.' });
+  const output = path.join(OUTPUT_DIR, job.id + '.mp4');
+  job.status = 'queued'; job.note = 'Menunggu antrean render. Antrean aktif: ' + (queuedRenders + 1); await persistJob(job);
+  res.status(202).json({ message: 'Render masuk antrean.', id: job.id, queued: queuedRenders + 1 });
+  enqueueRender(async () => {
     try {
+      job.status = 'processing'; job.note = 'Diproses FFmpeg (satu render pada satu waktu).'; await persistJob(job);
+      await ensureSourceLocal(job);
       const watermark = String(req.body.watermark ?? process.env.WATERMARK_TEXT ?? 'AUTOCLIP AI').slice(0, 48).replace(/[^\p{L}\p{N} _.-]/gu, '');
-      const draw = watermark ? `drawtext=text='${watermark.replace(/'/g, "\\'")}':fontcolor=white@0.85:fontsize=24:box=1:boxcolor=black@0.35:boxborderw=10:x=w-tw-24:y=h-th-24` : 'null';
-      const filters = `scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1,${draw}`;
+      const draw = watermark ? "drawtext=text='" + watermark.replace(/'/g, "\\\\'") + "':fontcolor=white@0.85:fontsize=24:box=1:boxcolor=black@0.35:boxborderw=10:x=w-tw-24:y=h-th-24" : 'null';
+      const filters = 'scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1,' + draw;
       await runFfmpeg(['-y', '-ss', String(start), '-i', job.sourcePath, '-t', String(duration), '-vf', filters, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '24', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', output]);
-      const s = await stat(output); const r2Key = await uploadToR2(output, `clips/${job.id}.mp4`);
-      job.status = 'review'; job.duration = duration; job.clipPath = r2Key || `/media/${job.id}.mp4`; job.fileSize = s.size; job.note = 'Klip siap diperiksa admin. Publikasi belum dilakukan.';
-      await persistJob(job);
-    } catch (e) { job.status = 'error'; job.note = e.message; await persistJob(job); }
-  })();
+      const fileStat = await stat(output); const r2Key = await uploadToR2(output, 'clips/' + job.id + '.mp4');
+      job.status = 'review'; job.duration = duration; job.clipPath = r2Key || '/media/' + job.id + '.mp4'; job.fileSize = fileStat.size; job.note = 'Klip siap diperiksa admin. Publikasi belum dilakukan.'; await persistJob(job);
+    } catch (error) { job.status = 'error'; job.note = error.message; await persistJob(job); }
+  });
 });
 app.get('/media/:id.mp4', auth, async (req, res) => {
   const file = path.join(OUTPUT_DIR, `${path.basename(req.params.id)}.mp4`);
