@@ -13,7 +13,6 @@ Admin dashboard + Node.js API for uploading source videos, generating 9:16 clips
 
 ## Not yet active
 - AI highlight detection and transcript-based clip suggestions are available when `OPENAI_API_KEY` is configured. This uses OpenAI transcription + text analysis APIs and incurs usage charges.
-- Burned-in subtitles are available when a video has an AI transcript; subtitle editing and final AI caption/hashtag generation are not yet implemented.
 - YouTube URL ingestion. Use videos you own or are authorized to process; platform restrictions apply.
 - TikTok and YouTube publishing. These require OAuth credentials, API scopes, platform app setup/approval, and a publishing implementation. Approval in this dashboard does not publish anything.
 - Full Supabase Auth / multi-user roles. This starter uses one server-configured admin login; Supabase is currently an optional records mirror.
