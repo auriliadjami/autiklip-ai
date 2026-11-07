@@ -35,13 +35,24 @@ Admin dashboard + Node.js API for uploading source videos, generating 9:16 clips
    ```
 7. Open `http://localhost:3000`.
 
-## Render deployment
-- Create a Web Service from this repository/ZIP after putting the source in GitHub.
-- Build command: `npm install`
-- Start command: `npm start`
-- Add the environment variables from `.env.example` in Render.
-- Important: Render free instances are ephemeral and can sleep. Source videos and finished clips are stored in R2 when configured; the worker downloads a source to temporary local disk only while processing. The current render queue is in-process and serial, not durable: queued work is lost on restart. Job metadata still uses local data/jobs.json with an optional Supabase mirror. Use a persistent worker/queue and load jobs from Supabase before production.
-- FFmpeg encoding may exceed free-instance resource limits. Treat free Render as a prototype environment, not a production video worker.
+## Deploy to Render (prototype)
+This repository includes a Render Blueprint in `render.yaml`. To deploy:
+1. Push/merge this repository to GitHub.
+2. In Render, choose **New > Blueprint** and select `auriliadjami/autiklip-ai`.
+3. Render creates the web service from `render.yaml`. Set the secret environment variables in the Render dashboard.
+4. Configure Supabase and R2 before processing real videos. Run the SQL migrations in `supabase/migrations/` in filename order in the Supabase SQL Editor.
+5. Confirm `/api/health` returns `ok: true`, then test with a short video you own.
+
+Required secrets/settings:
+- `ADMIN_EMAIL`, `ADMIN_PASSWORD_HASH` (bcrypt hash), and `JWT_SECRET` (at least 32 random characters).
+- `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` (server-side only; never expose in browser).
+- `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, and `R2_BUCKET`.
+- `OPENAI_API_KEY` only if AI transcription/highlight suggestions are needed. API usage is billed separately.
+
+The Blueprint marks secrets as `sync: false`; enter them manually in Render. Do not commit a real `.env` file or credentials.
+
+### Hosting limitations
+The free Render web service is suitable only for a prototype: it can sleep when idle, has ephemeral local storage, and limited CPU/RAM. FFmpeg rendering can be slow or fail on resource limits. Use Cloudflare R2 for source/output files and Supabase for job metadata. A single Render web instance runs the queue worker; do not scale multiple instances until worker coordination/heartbeat is designed and tested. For reliable production rendering, budget for an always-on worker with adequate CPU/RAM and persistent object storage. The free tier does not guarantee uninterrupted processing or production availability.
 
 ## AI highlight analysis (optional)
 - Set `OPENAI_API_KEY` on the server. The dashboard then offers **Analisis AI** for uploaded videos.
