@@ -122,7 +122,8 @@ async function ensureSourceLocal(job) {
 function escapeDrawtext(value) {
   return String(value).replace(/\\/g, '\\\\').replace(/:/g, '\\:').replace(/'/g, "\\'").replace(/%/g, '\\%');
 }
-\nasync function analyzeVideo(job) {
+
+async function analyzeVideo(job) {
   if (!process.env.OPENAI_API_KEY) throw new Error('OPENAI_API_KEY belum diisi. Tambahkan API key untuk mengaktifkan analisis AI.');
   const audioPath = path.join(DATA_DIR, `${job.id}-analysis.mp3`);
   try {
